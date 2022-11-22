@@ -6,6 +6,7 @@ edition = "2021"
 description = "A fork of `tokio-bincode`"
 keywords = ["networking", "bincode", "futures"]
 categories = ["network-programming", "asynchronous"]
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
