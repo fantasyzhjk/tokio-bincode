@@ -1,64 +1,40 @@
-//! Tokio codec for use with bincode
-//!
-//! This crate provides a `bincode` based codec that can be used with
-//! tokio's `Framed`, `FramedRead`, and `FramedWrite`.
-//!
-//! # Example
-//!
-//! ```
-//! # use futures::{Stream, Sink};
-//! # use tokio::io::{AsyncRead, AsyncWrite};
-//! # use tokio_codec::Framed;
-//! # use serde::{Serialize, Deserialize};
-//! # use tokio_bincode::BinCodec;
-//! # use serde_derive::{Serialize, Deserialize};
-//! # fn sd<'a>(transport: impl AsyncRead + AsyncWrite) {
-//! #[derive(Serialize, Deserialize)]
-//! struct MyProtocol;
-//!
-//! // Create the codec based on your custom protocol
-//! let codec = BinCodec::<MyProtocol>::new();
-//!
-//! // Frame the transport with the codec to produce a stream/sink
-//! let (sink, stream) = Framed::new(transport, codec).split();
-//! # }
-//! ```
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs, missing_debug_implementations)]
 
-use bincode::Config;
-use bytes::{BufMut, BytesMut};
-use serde::{Deserialize, Serialize};
+use bincode::{DefaultOptions, Options};
+use bytes::{Buf, BufMut, BytesMut};
+use serde::{Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::io::{self, Read};
 use std::marker::PhantomData;
-use tokio_codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder};
+
+/// Create a bincode based codec
+#[inline]
+pub fn bincodec<T: DeserializeOwned>() -> BinCodec<T, DefaultOptions>
+{
+    BinCodec::<T, DefaultOptions>::with_config(bincode::options())
+}
 
 /// Bincode based codec for use with `tokio-codec`
-pub struct BinCodec<T> {
-    config: Config,
+pub struct BinCodec<T, O> {
+    options: O,
     _pd: PhantomData<T>,
 }
 
-impl<T> BinCodec<T> {
-    /// Provides a bincode based codec
-    pub fn new() -> Self {
-        let config = bincode::config();
-        BinCodec::with_config(config)
-    }
-
+impl<T: DeserializeOwned, O: Options + Copy> BinCodec<T, O>
+{
     /// Provides a bincode based codec from the bincode config
-    pub fn with_config(config: Config) -> Self {
+    #[inline]
+    pub fn with_config(config: O) -> Self {
         BinCodec {
-            config,
+            options: config,
             _pd: PhantomData,
         }
     }
 }
 
-impl<T> Decoder for BinCodec<T>
-where
-    for<'de> T: Deserialize<'de>,
+impl<T: DeserializeOwned, O: Options + Copy> Decoder for BinCodec<T, O>
 {
     type Item = T;
     type Error = bincode::Error;
@@ -66,8 +42,8 @@ where
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if !buf.is_empty() {
             let mut reader = Reader::new(&buf[..]);
-            let message = self.config.deserialize_from(&mut reader)?;
-            buf.split_to(reader.amount());
+            let message = self.options.deserialize_from(&mut reader)?;
+            buf.advance(reader.amount());
             Ok(Some(message))
         } else {
             Ok(None)
@@ -75,23 +51,19 @@ where
     }
 }
 
-impl<T> Encoder for BinCodec<T>
-where
-    T: Serialize,
-{
-    type Item = T;
+impl<T: Serialize, O: Options + Copy> Encoder<T> for BinCodec<T, O> {
     type Error = bincode::Error;
 
     fn encode(&mut self, item: T, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        let size = self.config.serialized_size(&item)?;
+        let size = self.options.serialized_size(&item)?;
         buf.reserve(size as usize);
-        let message = self.config.serialize(&item)?;
+        let message = self.options.serialize(&item)?;
         buf.put(&message[..]);
         Ok(())
     }
 }
 
-impl<T> fmt::Debug for BinCodec<T> {
+impl<T, O> fmt::Debug for BinCodec<T, O> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("BinCodec").finish()
     }
@@ -122,63 +94,57 @@ impl<'buf, 'a> Read for &'a mut Reader<'buf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::{Future, Sink, Stream};
-    use serde_derive::{Deserialize, Serialize};
+mod test {
     use std::net::SocketAddr;
-    use tokio::{
-        codec::Framed,
-        net::{TcpListener, TcpStream},
-        runtime::current_thread,
-    };
+    use futures::sink::SinkExt;
+    use serde_derive::{Deserialize, Serialize};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::Framed;
+    use crate::bincodec;
 
-    #[derive(Deserialize, Serialize, Debug, Clone, Eq, PartialEq)]
+    #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
     enum Mock {
-        One,
-        Two,
+        One(u8),
+        Two(f32),
     }
 
-    #[test]
-    fn it_works() {
+    #[tokio::test]
+    async fn this_should_run() {
         let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), 15151);
-        let echo = TcpListener::bind(&addr).unwrap();
-
-        let jh = std::thread::spawn(move || {
-            current_thread::run(
-                echo.incoming()
-                    .map_err(bincode::Error::from)
-                    .take(1)
-                    .for_each(|stream| {
-                        let (w, r) = Framed::new(stream, BinCodec::<Mock>::new()).split();
-                        r.forward(w).map(|_| ())
-                    })
-                    .map_err(|_| ()),
-            )
+        let echo = TcpListener::bind(&addr).await.unwrap();
+        tokio::spawn(async move {
+            match echo.accept().await {
+                Ok((socket, addr)) => {
+                    println!("new client: {:?}", addr);
+                    let mut f = Framed::new(socket, bincodec::<Mock>());
+                    while let Some(Ok(p)) = f.next().await {
+                        dbg!(&p);
+                        f.send(p).await.unwrap()
+                    }
+                }
+                Err(e) => println!("couldn't get client: {:?}", e),
+            }
         });
 
-        let client = TcpStream::connect(&addr).wait().unwrap();
-        let client = Framed::new(client, BinCodec::<Mock>::new());
+        let client = TcpStream::connect(&addr).await.unwrap();
+        let mut client = Framed::new(client, bincodec::<Mock>());
+        client.send(Mock::One(1)).await.unwrap();
 
-        let client = client.send(Mock::One).wait().unwrap();
-
-        let (got, client) = match client.into_future().wait() {
+        let got = match client.next().await.unwrap() {
             Ok(x) => x,
-            Err((e, _)) => panic!(e),
+            Err(e) => panic!("{e}"),
         };
 
-        assert_eq!(got, Some(Mock::One));
+        assert_eq!(got, Mock::One(1));
 
-        let client = client.send(Mock::Two).wait().unwrap();
+        client.send(Mock::Two(2.0)).await.unwrap();
 
-        let (got2, client) = match client.into_future().wait() {
+        let got = match client.next().await.unwrap() {
             Ok(x) => x,
-            Err((e, _)) => panic!(e),
+            Err(e) => panic!("{e}"),
         };
 
-        assert_eq!(got2, Some(Mock::Two));
-
-        drop(client);
-        jh.join().unwrap();
+        assert_eq!(got, Mock::Two(2.0));
     }
 }
