@@ -7,6 +7,8 @@ description = "A fork of `tokio-bincode`"
 keywords = ["networking", "bincode", "futures"]
 categories = ["network-programming", "asynchronous"]
 license = "MIT"
+documentation = "https://docs.rs/tokio-bincodec"
+repository = "https://github.com/fantasyzhjk/tokio-bincodec"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
